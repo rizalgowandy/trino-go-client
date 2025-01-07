@@ -43,12 +43,11 @@
 //
 // The driver should be used via the database/sql package:
 //
-//  import "database/sql"
-//  import _ "github.com/trinodb/trino-go-client/trino"
+//	import "database/sql"
+//	import _ "github.com/trinodb/trino-go-client/trino"
 //
-//  dsn := "http://user@localhost:8080?catalog=default&schema=test"
-//  db, err := sql.Open("trino", dsn)
-//
+//	dsn := "http://user@localhost:8080?catalog=default&schema=test"
+//	db, err := sql.Open("trino", dsn)
 package trino
 
 import (
@@ -61,11 +60,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"net/http"
 	"net/url"
-	"regexp"
+	"os"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -73,13 +72,14 @@ import (
 	"time"
 	"unicode"
 
-	"gopkg.in/jcmturner/gokrb5.v6/client"
-	"gopkg.in/jcmturner/gokrb5.v6/config"
-	"gopkg.in/jcmturner/gokrb5.v6/keytab"
+	"github.com/jcmturner/gokrb5/v8/client"
+	"github.com/jcmturner/gokrb5/v8/config"
+	"github.com/jcmturner/gokrb5/v8/keytab"
+	"github.com/jcmturner/gokrb5/v8/spnego"
 )
 
 func init() {
-	sql.Register("trino", &sqldriver{})
+	sql.Register("trino", &Driver{})
 }
 
 var (
@@ -97,33 +97,55 @@ var (
 
 	// ErrUnsupportedHeader indicates that the server response contains an unsupported header.
 	ErrUnsupportedHeader = errors.New("trino: server response contains an unsupported header")
+
+	// ErrInvalidResponseType indicates that the server returned an invalid type definition.
+	ErrInvalidResponseType = errors.New("trino: server response contains an invalid type")
+
+	// ErrInvalidProgressCallbackHeader indicates that server did not get valid headers for progress callback
+	ErrInvalidProgressCallbackHeader = errors.New("trino: both " + trinoProgressCallbackParam + " and " + trinoProgressCallbackPeriodParam + " must be set when using progress callback")
 )
 
 const (
 	trinoHeaderPrefix = `X-Trino-`
-	
-	preparedStatementHeader    = trinoHeaderPrefix+"Prepared-Statement"
-	preparedStatementName      = "_trino_go"
 
-	trinoUserHeader            = trinoHeaderPrefix+`User`
-	trinoSourceHeader          = trinoHeaderPrefix+`Source`
-	trinoCatalogHeader         = trinoHeaderPrefix+`Catalog`
-	trinoSchemaHeader          = trinoHeaderPrefix+`Schema`
-	trinoSessionHeader         = trinoHeaderPrefix+`Session`
-	trinoSetCatalogHeader      = trinoHeaderPrefix+`Set-Catalog`
-	trinoSetSchemaHeader       = trinoHeaderPrefix+`Set-Schema`
-	trinoSetPathHeader         = trinoHeaderPrefix+`Set-Path`
-	trinoSetSessionHeader      = trinoHeaderPrefix+`Set-Session`
-	trinoClearSessionHeader    = trinoHeaderPrefix+`Clear-Session`
-	trinoSetRoleHeader         = trinoHeaderPrefix+`Set-Role`
-	trinoExtraCredentialHeader = trinoHeaderPrefix+`Extra-Credential`
+	preparedStatementHeader = trinoHeaderPrefix + "Prepared-Statement"
+	preparedStatementName   = "_trino_go"
 
-	KerberosEnabledConfig    = "KerberosEnabled"
-	kerberosKeytabPathConfig = "KerberosKeytabPath"
-	kerberosPrincipalConfig  = "KerberosPrincipal"
-	kerberosRealmConfig      = "KerberosRealm"
-	kerberosConfigPathConfig = "KerberosConfigPath"
-	SSLCertPathConfig        = "SSLCertPath"
+	trinoUserHeader            = trinoHeaderPrefix + `User`
+	trinoSourceHeader          = trinoHeaderPrefix + `Source`
+	trinoCatalogHeader         = trinoHeaderPrefix + `Catalog`
+	trinoSchemaHeader          = trinoHeaderPrefix + `Schema`
+	trinoSessionHeader         = trinoHeaderPrefix + `Session`
+	trinoSetCatalogHeader      = trinoHeaderPrefix + `Set-Catalog`
+	trinoSetSchemaHeader       = trinoHeaderPrefix + `Set-Schema`
+	trinoSetPathHeader         = trinoHeaderPrefix + `Set-Path`
+	trinoSetSessionHeader      = trinoHeaderPrefix + `Set-Session`
+	trinoClearSessionHeader    = trinoHeaderPrefix + `Clear-Session`
+	trinoSetRoleHeader         = trinoHeaderPrefix + `Set-Role`
+	trinoExtraCredentialHeader = trinoHeaderPrefix + `Extra-Credential`
+
+	trinoProgressCallbackParam       = trinoHeaderPrefix + `Progress-Callback`
+	trinoProgressCallbackPeriodParam = trinoHeaderPrefix + `Progress-Callback-Period`
+
+	trinoAddedPrepareHeader       = trinoHeaderPrefix + `Added-Prepare`
+	trinoDeallocatedPrepareHeader = trinoHeaderPrefix + `Deallocated-Prepare`
+
+	authorizationHeader = "Authorization"
+
+	kerberosEnabledConfig            = "KerberosEnabled"
+	kerberosKeytabPathConfig         = "KerberosKeytabPath"
+	kerberosPrincipalConfig          = "KerberosPrincipal"
+	kerberosRealmConfig              = "KerberosRealm"
+	kerberosConfigPathConfig         = "KerberosConfigPath"
+	kerberosRemoteServiceNameConfig  = "KerberosRemoteServiceName"
+	sslCertPathConfig                = "SSLCertPath"
+	sslCertConfig                    = "SSLCert"
+	accessTokenConfig                = "accessToken"
+	explicitPrepareConfig            = "explicitPrepare"
+	forwardAuthorizationHeaderConfig = "forwardAuthorizationHeader"
+
+	mapKeySeparator   = ":"
+	mapEntrySeparator = ";"
 )
 
 var (
@@ -133,35 +155,37 @@ var (
 	}
 	unsupportedResponseHeaders = []string{
 		trinoSetPathHeader,
-		trinoSetSessionHeader,
-		trinoClearSessionHeader,
 		trinoSetRoleHeader,
 	}
 )
 
-type sqldriver struct{}
+type Driver struct{}
 
-func (d *sqldriver) Open(name string) (driver.Conn, error) {
+func (d *Driver) Open(name string) (driver.Conn, error) {
 	return newConn(name)
 }
 
-var _ driver.Driver = &sqldriver{}
+var _ driver.Driver = &Driver{}
 
 // Config is a configuration that can be encoded to a DSN string.
 type Config struct {
-	ServerURI          string            // URI of the Trino server, e.g. http://user@localhost:8080
-	Source             string            // Source of the connection (optional)
-	Catalog            string            // Catalog (optional)
-	Schema             string            // Schema (optional)
-	SessionProperties  map[string]string // Session properties (optional)
-	ExtraCredentials   map[string]string // Extra credentials (optional)
-	CustomClientName   string            // Custom client name (optional)
-	KerberosEnabled    string            // KerberosEnabled (optional, default is false)
-	KerberosKeytabPath string            // Kerberos Keytab Path (optional)
-	KerberosPrincipal  string            // Kerberos Principal used to authenticate to KDC (optional)
-	KerberosRealm      string            // The Kerberos Realm (optional)
-	KerberosConfigPath string            // The krb5 config path (optional)
-	SSLCertPath        string            // The SSL cert path for TLS verification (optional)
+	ServerURI                  string            // URI of the Trino server, e.g. http://user@localhost:8080
+	Source                     string            // Source of the connection (optional)
+	Catalog                    string            // Catalog (optional)
+	Schema                     string            // Schema (optional)
+	SessionProperties          map[string]string // Session properties (optional)
+	ExtraCredentials           map[string]string // Extra credentials (optional)
+	CustomClientName           string            // Custom client name (optional)
+	KerberosEnabled            string            // KerberosEnabled (optional, default is false)
+	KerberosKeytabPath         string            // Kerberos Keytab Path (optional)
+	KerberosPrincipal          string            // Kerberos Principal used to authenticate to KDC (optional)
+	KerberosRemoteServiceName  string            // Trino coordinator Kerberos service name (optional)
+	KerberosRealm              string            // The Kerberos Realm (optional)
+	KerberosConfigPath         string            // The krb5 config path (optional)
+	SSLCertPath                string            // The SSL cert path for TLS verification (optional)
+	SSLCert                    string            // The SSL cert for TLS verification (optional)
+	AccessToken                string            // An access token (JWT) for authentication (optional)
+	ForwardAuthorizationHeader bool              // Allow forwarding the `accessToken` named query parameter in the authorization header, overwriting the `AccessToken` option, if set (optional)
 }
 
 // FormatDSN returns a DSN string from the configuration.
@@ -173,13 +197,13 @@ func (c *Config) FormatDSN() (string, error) {
 	var sessionkv []string
 	if c.SessionProperties != nil {
 		for k, v := range c.SessionProperties {
-			sessionkv = append(sessionkv, k+"="+v)
+			sessionkv = append(sessionkv, k+mapKeySeparator+v)
 		}
 	}
 	var credkv []string
 	if c.ExtraCredentials != nil {
 		for k, v := range c.ExtraCredentials {
-			credkv = append(credkv, k+"="+v)
+			credkv = append(credkv, k+mapKeySeparator+v)
 		}
 	}
 	source := c.Source
@@ -189,22 +213,52 @@ func (c *Config) FormatDSN() (string, error) {
 	query := make(url.Values)
 	query.Add("source", source)
 
+	if c.ForwardAuthorizationHeader {
+		query.Add(forwardAuthorizationHeaderConfig, "true")
+	}
+
 	KerberosEnabled, _ := strconv.ParseBool(c.KerberosEnabled)
 	isSSL := serverURL.Scheme == "https"
 
-	if isSSL && c.SSLCertPath != "" {
-		query.Add(SSLCertPathConfig, c.SSLCertPath)
+	if c.CustomClientName != "" {
+		if c.SSLCert != "" || c.SSLCertPath != "" {
+			return "", fmt.Errorf("trino: client configuration error, a custom client cannot be specific together with a custom SSL certificate")
+		}
+	}
+	if c.SSLCertPath != "" {
+		if !isSSL {
+			return "", fmt.Errorf("trino: client configuration error, SSL must be enabled to specify a custom SSL certificate file")
+		}
+		if c.SSLCert != "" {
+			return "", fmt.Errorf("trino: client configuration error, a custom SSL certificate file cannot be specified together with a certificate string")
+		}
+		query.Add(sslCertPathConfig, c.SSLCertPath)
+	}
+
+	if c.SSLCert != "" {
+		if !isSSL {
+			return "", fmt.Errorf("trino: client configuration error, SSL must be enabled to specify a custom SSL certificate")
+		}
+		if c.SSLCertPath != "" {
+			return "", fmt.Errorf("trino: client configuration error, a custom SSL certificate string cannot be specified together with a certificate file")
+		}
+		query.Add(sslCertConfig, c.SSLCert)
 	}
 
 	if KerberosEnabled {
-		query.Add(KerberosEnabledConfig, "true")
+		if !isSSL {
+			return "", fmt.Errorf("trino: client configuration error, SSL must be enabled for secure env")
+		}
+		query.Add(kerberosEnabledConfig, "true")
 		query.Add(kerberosKeytabPathConfig, c.KerberosKeytabPath)
 		query.Add(kerberosPrincipalConfig, c.KerberosPrincipal)
 		query.Add(kerberosRealmConfig, c.KerberosRealm)
 		query.Add(kerberosConfigPathConfig, c.KerberosConfigPath)
-		if !isSSL {
-			return "", fmt.Errorf("trino: client configuration error, SSL must be enabled for secure env")
+		remoteServiceName := c.KerberosRemoteServiceName
+		if remoteServiceName == "" {
+			remoteServiceName = "trino"
 		}
+		query.Add(kerberosRemoteServiceNameConfig, remoteServiceName)
 	}
 
 	// ensure consistent order of items
@@ -214,9 +268,10 @@ func (c *Config) FormatDSN() (string, error) {
 	for k, v := range map[string]string{
 		"catalog":            c.Catalog,
 		"schema":             c.Schema,
-		"session_properties": strings.Join(sessionkv, ","),
-		"extra_credentials":  strings.Join(credkv, ","),
+		"session_properties": strings.Join(sessionkv, mapEntrySeparator),
+		"extra_credentials":  strings.Join(credkv, mapEntrySeparator),
 		"custom_client":      c.CustomClientName,
+		accessTokenConfig:    c.AccessToken,
 	} {
 		if v != "" {
 			query[k] = []string{v}
@@ -228,12 +283,17 @@ func (c *Config) FormatDSN() (string, error) {
 
 // Conn is a Trino connection.
 type Conn struct {
-	baseURL         string
-	auth            *url.Userinfo
-	httpClient      http.Client
-	httpHeaders     http.Header
-	kerberosClient  client.Client
-	kerberosEnabled bool
+	baseURL                    string
+	auth                       *url.Userinfo
+	httpClient                 http.Client
+	httpHeaders                http.Header
+	kerberosEnabled            bool
+	kerberosClient             *client.Client
+	kerberosRemoteServiceName  string
+	progressUpdater            ProgressUpdater
+	progressUpdaterPeriod      queryProgressCallbackPeriod
+	useExplicitPrepare         bool
+	forwardAuthorizationHeader bool
 }
 
 var (
@@ -244,29 +304,33 @@ var (
 func newConn(dsn string) (*Conn, error) {
 	serverURL, err := url.Parse(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("trino: malformed dsn: %v", err)
+		return nil, fmt.Errorf("trino: malformed dsn: %w", err)
 	}
 
 	query := serverURL.Query()
 
-	kerberosEnabled, _ := strconv.ParseBool(query.Get(KerberosEnabledConfig))
+	kerberosEnabled, _ := strconv.ParseBool(query.Get(kerberosEnabledConfig))
 
-	var kerberosClient client.Client
+	forwardAuthorizationHeader, _ := strconv.ParseBool(query.Get(forwardAuthorizationHeaderConfig))
+
+	useExplicitPrepare := true
+	if query.Get(explicitPrepareConfig) != "" {
+		useExplicitPrepare, _ = strconv.ParseBool(query.Get(explicitPrepareConfig))
+	}
+
+	var kerberosClient *client.Client
 
 	if kerberosEnabled {
 		kt, err := keytab.Load(query.Get(kerberosKeytabPathConfig))
 		if err != nil {
-			return nil, fmt.Errorf("trino: Error loading Keytab: %v", err)
+			return nil, fmt.Errorf("trino: Error loading Keytab: %w", err)
 		}
-
-		kerberosClient = client.NewClientWithKeytab(query.Get(kerberosPrincipalConfig), query.Get(kerberosRealmConfig), kt)
 		conf, err := config.Load(query.Get(kerberosConfigPathConfig))
 		if err != nil {
-			return nil, fmt.Errorf("trino: Error loading krb config: %v", err)
+			return nil, fmt.Errorf("trino: Error loading krb config: %w", err)
 		}
 
-		kerberosClient.WithConfig(conf)
-
+		kerberosClient = client.NewWithKeytab(query.Get(kerberosPrincipalConfig), query.Get(kerberosRealmConfig), kt, conf)
 		loginErr := kerberosClient.Login()
 		if loginErr != nil {
 			return nil, fmt.Errorf("trino: Error login to KDC: %v", loginErr)
@@ -279,29 +343,40 @@ func newConn(dsn string) (*Conn, error) {
 		if httpClient == nil {
 			return nil, fmt.Errorf("trino: custom client not registered: %q", clientKey)
 		}
-	} else if certPath := query.Get(SSLCertPathConfig); certPath != "" && serverURL.Scheme == "https" {
-		cert, err := ioutil.ReadFile(certPath)
-		if err != nil {
-			return nil, fmt.Errorf("trino: Error loading SSL Cert File: %v", err)
-		}
-		certPool := x509.NewCertPool()
-		certPool.AppendCertsFromPEM(cert)
+	} else if serverURL.Scheme == "https" {
 
-		httpClient = &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					RootCAs: certPool,
+		cert := []byte(query.Get(sslCertConfig))
+
+		if certPath := query.Get(sslCertPathConfig); certPath != "" {
+			cert, err = os.ReadFile(certPath)
+			if err != nil {
+				return nil, fmt.Errorf("trino: Error loading SSL Cert File: %w", err)
+			}
+		}
+
+		if len(cert) != 0 {
+			certPool := x509.NewCertPool()
+			certPool.AppendCertsFromPEM(cert)
+
+			httpClient = &http.Client{
+				Transport: &http.Transport{
+					TLSClientConfig: &tls.Config{
+						RootCAs: certPool,
+					},
 				},
-			},
+			}
 		}
 	}
 
 	c := &Conn{
-		baseURL:         serverURL.Scheme + "://" + serverURL.Host,
-		httpClient:      *httpClient,
-		httpHeaders:     make(http.Header),
-		kerberosClient:  kerberosClient,
-		kerberosEnabled: kerberosEnabled,
+		baseURL:                    serverURL.Scheme + "://" + serverURL.Host,
+		httpClient:                 *httpClient,
+		httpHeaders:                make(http.Header),
+		kerberosClient:             kerberosClient,
+		kerberosEnabled:            kerberosEnabled,
+		kerberosRemoteServiceName:  query.Get(kerberosRemoteServiceNameConfig),
+		useExplicitPrepare:         useExplicitPrepare,
+		forwardAuthorizationHeader: forwardAuthorizationHeader,
 	}
 
 	var user string
@@ -314,19 +389,73 @@ func newConn(dsn string) (*Conn, error) {
 	}
 
 	for k, v := range map[string]string{
-		trinoUserHeader:            user,
-		trinoSourceHeader:          query.Get("source"),
-		trinoCatalogHeader:         query.Get("catalog"),
-		trinoSchemaHeader:          query.Get("schema"),
-		trinoSessionHeader:         query.Get("session_properties"),
-		trinoExtraCredentialHeader: query.Get("extra_credentials"),
+		trinoUserHeader:     user,
+		trinoSourceHeader:   query.Get("source"),
+		trinoCatalogHeader:  query.Get("catalog"),
+		trinoSchemaHeader:   query.Get("schema"),
+		authorizationHeader: getAuthorization(query.Get(accessTokenConfig)),
 	} {
 		if v != "" {
 			c.httpHeaders.Add(k, v)
 		}
 	}
+	for header, param := range map[string]string{
+		trinoSessionHeader:         "session_properties",
+		trinoExtraCredentialHeader: "extra_credentials",
+	} {
+		v := query.Get(param)
+		if v != "" {
+			c.httpHeaders[header], err = decodeMapHeader(param, v)
+			if err != nil {
+				return c, err
+			}
+		}
+	}
 
 	return c, nil
+}
+
+func decodeMapHeader(name, input string) ([]string, error) {
+	result := []string{}
+	for _, entry := range strings.Split(input, mapEntrySeparator) {
+		parts := strings.SplitN(entry, mapKeySeparator, 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("trino: Malformed %s: %s", name, input)
+		}
+		key := parts[0]
+		value := parts[1]
+		if len(key) == 0 {
+			return nil, fmt.Errorf("trino: %s key is empty", name)
+		}
+		if len(value) == 0 {
+			return nil, fmt.Errorf("trino: %s value is empty", name)
+		}
+		if !isASCII(key) {
+			return nil, fmt.Errorf("trino: %s key '%s' contains spaces or is not printable ASCII", name, key)
+		}
+		if !isASCII(value) {
+			// do not log value as it may contain sensitive information
+			return nil, fmt.Errorf("trino: %s value for key '%s' contains spaces or is not printable ASCII", name, key)
+		}
+		result = append(result, key+"="+url.QueryEscape(value))
+	}
+	return result, nil
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '\u0021' || s[i] > '\u007E' {
+			return false
+		}
+	}
+	return true
+}
+
+func getAuthorization(token string) string {
+	if token == "" {
+		return ""
+	}
+	return fmt.Sprintf("Bearer %s", token)
 }
 
 // registry for custom http clients
@@ -360,7 +489,6 @@ var customClientRegistry = struct {
 //	}
 //	trino.RegisterCustomClient("foobar", foobarClient)
 //	db, err := sql.Open("trino", "https://user@localhost:8080?custom_client=foobar")
-//
 func RegisterCustomClient(key string, client *http.Client) error {
 	if _, err := strconv.ParseBool(key); err == nil {
 		return fmt.Errorf("trino: custom client key %q is reserved", key)
@@ -407,16 +535,20 @@ func (c *Conn) Close() error {
 	return nil
 }
 
-func (c *Conn) newRequest(method, url string, body io.Reader, hs http.Header) (*http.Request, error) {
-	req, err := http.NewRequest(method, url, body)
+func (c *Conn) newRequest(ctx context.Context, method, url string, body io.Reader, hs http.Header) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
-		return nil, fmt.Errorf("trino: %v", err)
+		return nil, fmt.Errorf("trino: %w", err)
 	}
 
 	if c.kerberosEnabled {
-		err = c.kerberosClient.SetSPNEGOHeader(req, "trino/"+req.URL.Hostname())
+		remoteServiceName := "trino"
+		if c.kerberosRemoteServiceName != "" {
+			remoteServiceName = c.kerberosRemoteServiceName
+		}
+		err = spnego.SetSPNEGOHeader(c.kerberosClient, req, remoteServiceName+"/"+req.URL.Hostname())
 		if err != nil {
-			return nil, fmt.Errorf("error setting client SPNEGO header: %v", err)
+			return nil, fmt.Errorf("error setting client SPNEGO header: %w", err)
 		}
 	}
 
@@ -444,14 +576,7 @@ func (c *Conn) roundTrip(ctx context.Context, req *http.Request) (*http.Response
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-timer.C:
-			timeout := DefaultQueryTimeout
-			if deadline, ok := ctx.Deadline(); ok {
-				timeout = time.Until(deadline)
-			}
-			client := c.httpClient
-			client.Timeout = timeout
-			req.Cancel = ctx.Done()
-			resp, err := client.Do(req)
+			resp, err := c.httpClient.Do(req)
 			if err != nil {
 				return nil, &ErrQueryFailed{Reason: err}
 			}
@@ -462,13 +587,37 @@ func (c *Conn) roundTrip(ctx context.Context, req *http.Request) (*http.Response
 						c.httpHeaders.Set(dst, v)
 					}
 				}
+				if v := resp.Header.Get(trinoAddedPrepareHeader); v != "" {
+					c.httpHeaders.Add(preparedStatementHeader, v)
+				}
+				if v := resp.Header.Get(trinoDeallocatedPrepareHeader); v != "" {
+					values := c.httpHeaders.Values(preparedStatementHeader)
+					c.httpHeaders.Del(preparedStatementHeader)
+					for _, v2 := range values {
+						if !strings.HasPrefix(v2, v+"=") {
+							c.httpHeaders.Add(preparedStatementHeader, v2)
+						}
+					}
+				}
+				if v := resp.Header.Get(trinoSetSessionHeader); v != "" {
+					c.httpHeaders.Add(trinoSessionHeader, v)
+				}
+				if v := resp.Header.Get(trinoClearSessionHeader); v != "" {
+					values := c.httpHeaders.Values(trinoSessionHeader)
+					c.httpHeaders.Del(trinoSessionHeader)
+					for _, v2 := range values {
+						if !strings.HasPrefix(v2, v+"=") {
+							c.httpHeaders.Add(trinoSessionHeader, v2)
+						}
+					}
+				}
 				for _, name := range unsupportedResponseHeaders {
 					if v := resp.Header.Get(name); v != "" {
 						return nil, ErrUnsupportedHeader
 					}
 				}
 				return resp, nil
-			case http.StatusServiceUnavailable:
+			case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 				resp.Body.Close()
 				timer.Reset(delay)
 				delay = time.Duration(math.Min(
@@ -495,11 +644,16 @@ func (e *ErrQueryFailed) Error() string {
 		e.StatusCode, http.StatusText(e.StatusCode), e.Reason)
 }
 
+// Unwrap implements the unwrap interface.
+func (e *ErrQueryFailed) Unwrap() error {
+	return e.Reason
+}
+
 func newErrQueryFailedFromResponse(resp *http.Response) *ErrQueryFailed {
 	const maxBytes = 8 * 1024
 	defer resp.Body.Close()
 	qf := &ErrQueryFailed{StatusCode: resp.StatusCode}
-	b, err := ioutil.ReadAll(io.LimitReader(resp.Body, maxBytes))
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes))
 	if err != nil {
 		qf.Reason = err
 		return qf
@@ -513,18 +667,46 @@ func newErrQueryFailedFromResponse(resp *http.Response) *ErrQueryFailed {
 }
 
 type driverStmt struct {
-	conn  *Conn
-	query string
-	user  string
+	conn           *Conn
+	query          string
+	user           string
+	nextURIs       chan string
+	httpResponses  chan *http.Response
+	queryResponses chan queryResponse
+	statsCh        chan QueryProgressInfo
+	errors         chan error
+	doneCh         chan struct{}
 }
 
 var (
-	_ driver.Stmt             = &driverStmt{}
-	_ driver.StmtQueryContext = &driverStmt{}
-	_ driver.StmtExecContext  = &driverStmt{}
+	_ driver.Stmt              = &driverStmt{}
+	_ driver.StmtQueryContext  = &driverStmt{}
+	_ driver.StmtExecContext   = &driverStmt{}
+	_ driver.NamedValueChecker = &driverStmt{}
 )
 
+// Close closes statement just before releasing connection
 func (st *driverStmt) Close() error {
+	if st.doneCh == nil {
+		return nil
+	}
+	close(st.doneCh)
+	if st.statsCh != nil {
+		<-st.statsCh
+		st.statsCh = nil
+	}
+	go func() {
+		// drain errors chan to allow goroutines to write to it
+		for range st.errors {
+		}
+	}()
+	for range st.queryResponses {
+	}
+	for range st.httpResponses {
+	}
+	close(st.nextURIs)
+	close(st.errors)
+	st.doneCh = nil
 	return nil
 }
 
@@ -547,15 +729,42 @@ func (st *driverStmt) ExecContext(ctx context.Context, args []driver.NamedValue)
 		queryID:      sr.ID,
 		nextURI:      sr.NextURI,
 		rowsAffected: sr.UpdateCount,
+		statsCh:      st.statsCh,
+		doneCh:       st.doneCh,
 	}
 	// consume all results, if there are any
 	for err == nil {
-		err = rows.fetch(true)
+		err = rows.fetch()
 	}
+
 	if err != nil && err != io.EOF {
 		return nil, err
 	}
 	return rows, nil
+}
+
+func (st *driverStmt) CheckNamedValue(arg *driver.NamedValue) error {
+	switch arg.Value.(type) {
+	case nil:
+		return nil
+	case Numeric, trinoDate, trinoTime, trinoTimeTz, trinoTimestamp, time.Duration:
+		return nil
+	default:
+		{
+			if reflect.TypeOf(arg.Value).Kind() == reflect.Slice {
+				return nil
+			}
+
+			if arg.Name == trinoProgressCallbackParam {
+				return nil
+			}
+			if arg.Name == trinoProgressCallbackPeriodParam {
+				return nil
+			}
+		}
+	}
+
+	return driver.ErrSkip
 }
 
 type stmtResponse struct {
@@ -563,48 +772,72 @@ type stmtResponse struct {
 	InfoURI     string    `json:"infoUri"`
 	NextURI     string    `json:"nextUri"`
 	Stats       stmtStats `json:"stats"`
-	Error       stmtError `json:"error"`
+	Error       ErrTrino  `json:"error"`
 	UpdateType  string    `json:"updateType"`
 	UpdateCount int64     `json:"updateCount"`
 }
 
 type stmtStats struct {
-	State           string    `json:"state"`
-	Scheduled       bool      `json:"scheduled"`
-	Nodes           int       `json:"nodes"`
-	TotalSplits     int       `json:"totalSplits"`
-	QueuesSplits    int       `json:"queuedSplits"`
-	RunningSplits   int       `json:"runningSplits"`
-	CompletedSplits int       `json:"completedSplits"`
-	UserTimeMillis  int       `json:"userTimeMillis"`
-	CPUTimeMillis   int       `json:"cpuTimeMillis"`
-	WallTimeMillis  int       `json:"wallTimeMillis"`
-	ProcessedRows   int       `json:"processedRows"`
-	ProcessedBytes  int       `json:"processedBytes"`
-	RootStage       stmtStage `json:"rootStage"`
+	State                string      `json:"state"`
+	Scheduled            bool        `json:"scheduled"`
+	Nodes                int         `json:"nodes"`
+	TotalSplits          int         `json:"totalSplits"`
+	QueuesSplits         int         `json:"queuedSplits"`
+	RunningSplits        int         `json:"runningSplits"`
+	CompletedSplits      int         `json:"completedSplits"`
+	UserTimeMillis       int         `json:"userTimeMillis"`
+	CPUTimeMillis        int64       `json:"cpuTimeMillis"`
+	WallTimeMillis       int64       `json:"wallTimeMillis"`
+	QueuedTimeMillis     int64       `json:"queuedTimeMillis"`
+	ElapsedTimeMillis    int64       `json:"elapsedTimeMillis"`
+	ProcessedRows        int64       `json:"processedRows"`
+	ProcessedBytes       int64       `json:"processedBytes"`
+	PhysicalInputBytes   int64       `json:"physicalInputBytes"`
+	PhysicalWrittenBytes int64       `json:"physicalWrittenBytes"`
+	PeakMemoryBytes      int64       `json:"peakMemoryBytes"`
+	SpilledBytes         int64       `json:"spilledBytes"`
+	RootStage            stmtStage   `json:"rootStage"`
+	ProgressPercentage   jsonFloat64 `json:"progressPercentage"`
+	RunningPercentage    jsonFloat64 `json:"runningPercentage"`
 }
 
-type stmtError struct {
-	Message       string               `json:"message"`
-	ErrorName     string               `json:"errorName"`
-	ErrorCode     int                  `json:"errorCode"`
-	ErrorLocation stmtErrorLocation    `json:"errorLocation"`
-	FailureInfo   stmtErrorFailureInfo `json:"failureInfo"`
-	// Other fields omitted
+type ErrTrino struct {
+	Message       string        `json:"message"`
+	SqlState      string        `json:"sqlState"`
+	ErrorCode     int           `json:"errorCode"`
+	ErrorName     string        `json:"errorName"`
+	ErrorType     string        `json:"errorType"`
+	ErrorLocation ErrorLocation `json:"errorLocation"`
+	FailureInfo   FailureInfo   `json:"failureInfo"`
 }
 
-type stmtErrorLocation struct {
+func (i ErrTrino) Error() string {
+	return i.ErrorType + ": " + i.Message
+}
+
+type ErrorLocation struct {
 	LineNumber   int `json:"lineNumber"`
 	ColumnNumber int `json:"columnNumber"`
 }
 
-type stmtErrorFailureInfo struct {
-	Type string `json:"type"`
-	// Other fields omitted
+type FailureInfo struct {
+	Type          string        `json:"type"`
+	Message       string        `json:"message"`
+	Cause         *FailureInfo  `json:"cause"`
+	Suppressed    []FailureInfo `json:"suppressed"`
+	Stack         []string      `json:"stack"`
+	ErrorInfo     ErrorInfo     `json:"errorInfo"`
+	ErrorLocation ErrorLocation `json:"errorLocation"`
 }
 
-func (e stmtError) Error() string {
-	return e.FailureInfo.Type + ": " + e.Message
+type ErrorInfo struct {
+	Code int    `json:"code"`
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+func (i ErrorInfo) Error() string {
+	return fmt.Sprintf("%s: %s (%d)", i.Type, i.Name, i.Code)
 }
 
 type stmtStage struct {
@@ -624,6 +857,28 @@ type stmtStage struct {
 	SubStages       []stmtStage `json:"subStages"`
 }
 
+type jsonFloat64 float64
+
+func (f *jsonFloat64) UnmarshalJSON(data []byte) error {
+	var v float64
+	err := json.Unmarshal(data, &v)
+	if err != nil {
+		var jsonErr *json.UnmarshalTypeError
+		if errors.As(err, &jsonErr) {
+			if f != nil {
+				*f = 0
+			}
+			return nil
+		}
+		return err
+	}
+	p := (*float64)(f)
+	*p = v
+	return nil
+}
+
+var _ json.Unmarshaler = new(jsonFloat64)
+
 func (st *driverStmt) Query(args []driver.Value) (driver.Rows, error) {
 	return nil, driver.ErrSkip
 }
@@ -638,8 +893,10 @@ func (st *driverStmt) QueryContext(ctx context.Context, args []driver.NamedValue
 		stmt:    st,
 		queryID: sr.ID,
 		nextURI: sr.NextURI,
+		statsCh: st.statsCh,
+		doneCh:  st.doneCh,
 	}
-	if err = rows.fetch(false); err != nil {
+	if err = rows.fetch(); err != nil && err != io.EOF {
 		return nil, err
 	}
 	return rows, nil
@@ -647,12 +904,28 @@ func (st *driverStmt) QueryContext(ctx context.Context, args []driver.NamedValue
 
 func (st *driverStmt) exec(ctx context.Context, args []driver.NamedValue) (*stmtResponse, error) {
 	query := st.query
-	var hs http.Header
+	hs := make(http.Header)
+	// Ensure the server returns timestamps preserving their precision, without truncating them to timestamp(3).
+	hs.Add("X-Trino-Client-Capabilities", "PARAMETRIC_DATETIME")
 
 	if len(args) > 0 {
-		hs = make(http.Header)
 		var ss []string
 		for _, arg := range args {
+			if arg.Name == trinoProgressCallbackParam {
+				st.conn.progressUpdater = arg.Value.(ProgressUpdater)
+				continue
+			}
+			if arg.Name == trinoProgressCallbackPeriodParam {
+				st.conn.progressUpdaterPeriod.Period = arg.Value.(time.Duration)
+				continue
+			}
+
+			if st.conn.forwardAuthorizationHeader && arg.Name == accessTokenConfig {
+				token := arg.Value.(string)
+				hs.Add(authorizationHeader, getAuthorization(token))
+				continue
+			}
+
 			s, err := Serial(arg.Value)
 			if err != nil {
 				return nil, err
@@ -667,24 +940,40 @@ func (st *driverStmt) exec(ctx context.Context, args []driver.NamedValue) (*stmt
 
 				hs.Add(arg.Name, headerValue)
 			} else {
-				if hs.Get(preparedStatementHeader) == "" {
+				if st.conn.useExplicitPrepare && hs.Get(preparedStatementHeader) == "" {
+					for _, v := range st.conn.httpHeaders.Values(preparedStatementHeader) {
+						hs.Add(preparedStatementHeader, v)
+					}
 					hs.Add(preparedStatementHeader, preparedStatementName+"="+url.QueryEscape(st.query))
 				}
 				ss = append(ss, s)
 			}
 		}
+		if (st.conn.progressUpdater != nil && st.conn.progressUpdaterPeriod.Period == 0) || (st.conn.progressUpdater == nil && st.conn.progressUpdaterPeriod.Period > 0) {
+			return nil, ErrInvalidProgressCallbackHeader
+		}
 		if len(ss) > 0 {
-			query = "EXECUTE " + preparedStatementName + " USING " + strings.Join(ss, ", ")
+			if st.conn.useExplicitPrepare {
+				query = "EXECUTE " + preparedStatementName + " USING " + strings.Join(ss, ", ")
+			} else {
+				query = "EXECUTE IMMEDIATE " + formatStringLiteral(st.query) + " USING " + strings.Join(ss, ", ")
+			}
 		}
 	}
 
-	req, err := st.conn.newRequest("POST", st.conn.baseURL+"/v1/statement", strings.NewReader(query), hs)
+	var cancel context.CancelFunc = func() {}
+	if _, ok := ctx.Deadline(); !ok {
+		ctx, cancel = context.WithTimeout(ctx, DefaultQueryTimeout)
+	}
+	req, err := st.conn.newRequest(ctx, "POST", st.conn.baseURL+"/v1/statement", strings.NewReader(query), hs)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 
 	resp, err := st.conn.roundTrip(ctx, req)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 
@@ -694,9 +983,130 @@ func (st *driverStmt) exec(ctx context.Context, args []driver.NamedValue) (*stmt
 	d.UseNumber()
 	err = d.Decode(&sr)
 	if err != nil {
-		return nil, fmt.Errorf("trino: %v", err)
+		cancel()
+		return nil, fmt.Errorf("trino: %w", err)
+	}
+
+	st.doneCh = make(chan struct{})
+	st.nextURIs = make(chan string)
+	st.httpResponses = make(chan *http.Response)
+	st.queryResponses = make(chan queryResponse)
+	st.errors = make(chan error)
+	go func() {
+		defer close(st.httpResponses)
+		for {
+			select {
+			case nextURI := <-st.nextURIs:
+				if nextURI == "" {
+					return
+				}
+				hs := make(http.Header)
+				hs.Add(trinoUserHeader, st.user)
+				req, err := st.conn.newRequest(ctx, "GET", nextURI, nil, hs)
+				if err != nil {
+					if ctx.Err() == context.Canceled {
+						st.errors <- context.Canceled
+						return
+					}
+					st.errors <- err
+					return
+				}
+				resp, err := st.conn.roundTrip(ctx, req)
+				if err != nil {
+					if ctx.Err() == context.Canceled {
+						st.errors <- context.Canceled
+						return
+					}
+					st.errors <- err
+					return
+				}
+				select {
+				case st.httpResponses <- resp:
+				case <-st.doneCh:
+					return
+				}
+			case <-st.doneCh:
+				return
+			}
+		}
+	}()
+	go func() {
+		defer close(st.queryResponses)
+		defer cancel()
+		for {
+			select {
+			case resp := <-st.httpResponses:
+				if resp == nil {
+					return
+				}
+				var qresp queryResponse
+				d := json.NewDecoder(resp.Body)
+				d.UseNumber()
+				err = d.Decode(&qresp)
+				if err != nil {
+					st.errors <- fmt.Errorf("trino: %w", err)
+					return
+				}
+				err = resp.Body.Close()
+				if err != nil {
+					st.errors <- err
+					return
+				}
+				err = handleResponseError(resp.StatusCode, qresp.Error)
+				if err != nil {
+					st.errors <- err
+					return
+				}
+				select {
+				case st.nextURIs <- qresp.NextURI:
+				case <-st.doneCh:
+					return
+				}
+				select {
+				case st.queryResponses <- qresp:
+				case <-st.doneCh:
+					return
+				}
+			case <-st.doneCh:
+				return
+			}
+		}
+	}()
+	st.nextURIs <- sr.NextURI
+	if st.conn.progressUpdater != nil {
+		st.statsCh = make(chan QueryProgressInfo)
+
+		// progress updater go func
+		go func() {
+			for {
+				select {
+				case stats := <-st.statsCh:
+					st.conn.progressUpdater.Update(stats)
+				case <-st.doneCh:
+					close(st.statsCh)
+					return
+				}
+			}
+		}()
+
+		// initial progress callback call
+		srStats := QueryProgressInfo{
+			QueryId:    sr.ID,
+			QueryStats: sr.Stats,
+		}
+		select {
+		case st.statsCh <- srStats:
+		default:
+			// ignore when can't send stats
+		}
+		st.conn.progressUpdaterPeriod.LastCallbackTime = time.Now()
+		st.conn.progressUpdaterPeriod.LastQueryState = sr.Stats.State
 	}
 	return &sr, handleResponseError(resp.StatusCode, sr.Error)
+}
+
+func formatStringLiteral(query string) string {
+	return "'" + strings.ReplaceAll(query, "'", "''") + "'"
 }
 
 type driverRows struct {
@@ -711,10 +1121,17 @@ type driverRows struct {
 	coltype      []*typeConverter
 	data         []queryData
 	rowsAffected int64
+
+	statsCh chan QueryProgressInfo
+	doneCh  chan struct{}
 }
 
 var _ driver.Rows = &driverRows{}
 var _ driver.Result = &driverRows{}
+var _ driver.RowsColumnTypeScanType = &driverRows{}
+var _ driver.RowsColumnTypeDatabaseTypeName = &driverRows{}
+var _ driver.RowsColumnTypeLength = &driverRows{}
+var _ driver.RowsColumnTypePrecisionScale = &driverRows{}
 
 // Close closes the rows iterator.
 func (qr *driverRows) Close() error {
@@ -726,12 +1143,12 @@ func (qr *driverRows) Close() error {
 	if qr.stmt.user != "" {
 		hs.Add(trinoUserHeader, qr.stmt.user)
 	}
-	req, err := qr.stmt.conn.newRequest("DELETE", qr.stmt.conn.baseURL+"/v1/query/"+url.PathEscape(qr.queryID), nil, hs)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(qr.ctx), DefaultCancelQueryTimeout)
+	defer cancel()
+	req, err := qr.stmt.conn.newRequest(ctx, "DELETE", qr.stmt.conn.baseURL+"/v1/query/"+url.PathEscape(qr.queryID), nil, hs)
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), DefaultCancelQueryTimeout)
-	defer cancel()
 	resp, err := qr.stmt.conn.roundTrip(ctx, req)
 	if err != nil {
 		qferr, ok := err.(*ErrQueryFailed)
@@ -751,7 +1168,7 @@ func (qr *driverRows) Columns() []string {
 		return []string{}
 	}
 	if qr.columns == nil {
-		if err := qr.fetch(false); err != nil {
+		if err := qr.fetch(); err != nil && err != io.EOF {
 			qr.err = err
 			return []string{}
 		}
@@ -759,14 +1176,24 @@ func (qr *driverRows) Columns() []string {
 	return qr.columns
 }
 
-var coltypeLengthSuffix = regexp.MustCompile(`\(\d+\)$`)
-
 func (qr *driverRows) ColumnTypeDatabaseTypeName(index int) string {
-	name := qr.coltype[index].typeName
-	if m := coltypeLengthSuffix.FindStringSubmatch(name); m != nil {
-		name = name[0 : len(name)-len(m[0])]
+	typeName := qr.coltype[index].parsedType[0]
+	if typeName == "map" || typeName == "array" || typeName == "row" {
+		typeName = qr.coltype[index].typeName
 	}
-	return name
+	return strings.ToUpper(typeName)
+}
+
+func (qr *driverRows) ColumnTypeScanType(index int) reflect.Type {
+	return qr.coltype[index].scanType
+}
+
+func (qr *driverRows) ColumnTypeLength(index int) (int64, bool) {
+	return qr.coltype[index].size.value, qr.coltype[index].size.hasValue
+}
+
+func (qr *driverRows) ColumnTypePrecisionScale(index int) (precision, scale int64, ok bool) {
+	return qr.coltype[index].precision.value, qr.coltype[index].scale.value, qr.coltype[index].precision.hasValue
 }
 
 // Next is called to populate the next row of data into
@@ -783,7 +1210,7 @@ func (qr *driverRows) Next(dest []driver.Value) error {
 			qr.err = io.EOF
 			return qr.err
 		}
-		if err := qr.fetch(true); err != nil {
+		if err := qr.fetch(); err != nil {
 			qr.err = err
 			return err
 		}
@@ -793,6 +1220,9 @@ func (qr *driverRows) Next(dest []driver.Value) error {
 		return qr.err
 	}
 	for i, v := range qr.coltype {
+		if i > len(dest)-1 {
+			break
+		}
 		vv, err := v.ConvertValue(qr.data[qr.rowindex][i])
 		if err != nil {
 			qr.err = err
@@ -813,7 +1243,7 @@ func (qr driverRows) LastInsertId() (int64, error) {
 
 // RowsAffected returns the number of rows affected by the query.
 func (qr driverRows) RowsAffected() (int64, error) {
-	return qr.rowsAffected, qr.err
+	return qr.rowsAffected, nil
 }
 
 type queryResponse struct {
@@ -824,7 +1254,7 @@ type queryResponse struct {
 	Columns          []queryColumn `json:"columns"`
 	Data             []queryData   `json:"data"`
 	Stats            stmtStats     `json:"stats"`
-	Error            stmtError     `json:"error"`
+	Error            ErrTrino      `json:"error"`
 	UpdateType       string        `json:"updateType"`
 	UpdateCount      int64         `json:"updateCount"`
 }
@@ -837,13 +1267,42 @@ type queryColumn struct {
 
 type queryData []interface{}
 
-type typeSignature struct {
-	RawType          string        `json:"rawType"`
-	TypeArguments    []interface{} `json:"typeArguments"`
-	LiteralArguments []interface{} `json:"literalArguments"`
+type namedTypeSignature struct {
+	FieldName     rowFieldName  `json:"fieldName"`
+	TypeSignature typeSignature `json:"typeSignature"`
 }
 
-func handleResponseError(status int, respErr stmtError) error {
+type rowFieldName struct {
+	Name string `json:"name"`
+}
+
+type typeSignature struct {
+	RawType   string         `json:"rawType"`
+	Arguments []typeArgument `json:"arguments"`
+}
+
+type typeKind string
+
+const (
+	KIND_TYPE       = typeKind("TYPE")
+	KIND_NAMED_TYPE = typeKind("NAMED_TYPE")
+	KIND_LONG       = typeKind("LONG")
+	KIND_VARIABLE   = typeKind("VARIABLE")
+)
+
+type typeArgument struct {
+	// Kind determines if the typeSignature, namedTypeSignature, or long field has a value
+	Kind  typeKind        `json:"kind"`
+	Value json.RawMessage `json:"value"`
+	// typeSignature decoded from Value when Kind is TYPE
+	typeSignature typeSignature
+	// namedTypeSignature decoded from Value when Kind is NAMED_TYPE
+	namedTypeSignature namedTypeSignature
+	// long decoded from Value when Kind is LONG
+	long int64
+}
+
+func handleResponseError(status int, respErr ErrTrino) error {
 	switch respErr.ErrorName {
 	case "":
 		return nil
@@ -857,95 +1316,275 @@ func handleResponseError(status int, respErr stmtError) error {
 	}
 }
 
-func (qr *driverRows) fetch(allowEOF bool) error {
-	if qr.nextURI == "" {
-		if allowEOF {
-			return io.EOF
-		}
-		return nil
-	}
-	hs := make(http.Header)
-	hs.Add(trinoUserHeader, qr.stmt.user)
-	req, err := qr.stmt.conn.newRequest("GET", qr.nextURI, nil, hs)
-	if err != nil {
-		return err
-	}
-	resp, err := qr.stmt.conn.roundTrip(qr.ctx, req)
-	if err != nil {
-		if qr.ctx.Err() == context.Canceled {
-			qr.Close()
+func (qr *driverRows) fetch() error {
+	var qresp queryResponse
+	var err error
+	for {
+		select {
+		case qresp = <-qr.stmt.queryResponses:
+			if qresp.ID == "" {
+				return io.EOF
+			}
+			err = qr.initColumns(&qresp)
+			if err != nil {
+				return err
+			}
+			qr.rowindex = 0
+			qr.data = qresp.Data
+			qr.rowsAffected = qresp.UpdateCount
+			qr.scheduleProgressUpdate(qresp.ID, qresp.Stats)
+			if len(qr.data) != 0 {
+				return nil
+			}
+		case err = <-qr.stmt.errors:
+			if err == nil {
+				// Channel was closed, which means the statement
+				// or rows were closed.
+				err = io.EOF
+			} else if err == context.Canceled {
+				qr.Close()
+			}
+			qr.err = err
 			return err
 		}
-		return err
 	}
-	defer resp.Body.Close()
-	var qresp queryResponse
-	d := json.NewDecoder(resp.Body)
-	d.UseNumber()
-	err = d.Decode(&qresp)
-	if err != nil {
-		return fmt.Errorf("trino: %v", err)
-	}
-	err = handleResponseError(resp.StatusCode, qresp.Error)
-	if err != nil {
-		return err
-	}
+}
 
-	qr.rowindex = 0
-	qr.data = qresp.Data
-	qr.nextURI = qresp.NextURI
-	if len(qr.data) == 0 {
-		if qr.nextURI != "" {
-			return qr.fetch(allowEOF)
+func unmarshalArguments(signature *typeSignature) error {
+	for i, argument := range signature.Arguments {
+		var payload interface{}
+		switch argument.Kind {
+		case KIND_TYPE:
+			payload = &(signature.Arguments[i].typeSignature)
+		case KIND_NAMED_TYPE:
+			payload = &(signature.Arguments[i].namedTypeSignature)
+		case KIND_LONG:
+			payload = &(signature.Arguments[i].long)
 		}
-		if allowEOF {
-			qr.err = io.EOF
-			return qr.err
+		err := json.Unmarshal(argument.Value, payload)
+		if err != nil {
+			return err
+		}
+		switch argument.Kind {
+		case KIND_TYPE:
+			err = unmarshalArguments(&(signature.Arguments[i].typeSignature))
+		case KIND_NAMED_TYPE:
+			err = unmarshalArguments(&(signature.Arguments[i].namedTypeSignature.TypeSignature))
+		}
+		if err != nil {
+			return err
 		}
 	}
-	if qr.columns == nil && len(qresp.Columns) > 0 {
-		qr.initColumns(&qresp)
-	}
-	qr.rowsAffected = qresp.UpdateCount
 	return nil
 }
 
-func (qr *driverRows) initColumns(qresp *queryResponse) {
+func (qr *driverRows) initColumns(qresp *queryResponse) error {
+	if qr.columns != nil || len(qresp.Columns) == 0 {
+		return nil
+	}
+	var err error
+	for i := range qresp.Columns {
+		err = unmarshalArguments(&(qresp.Columns[i].TypeSignature))
+		if err != nil {
+			return fmt.Errorf("error decoding column type signature: %w", err)
+		}
+	}
 	qr.columns = make([]string, len(qresp.Columns))
 	qr.coltype = make([]*typeConverter, len(qresp.Columns))
 	for i, col := range qresp.Columns {
+		err = unmarshalArguments(&(qresp.Columns[i].TypeSignature))
+		if err != nil {
+			return fmt.Errorf("error decoding column type signature: %w", err)
+		}
 		qr.columns[i] = col.Name
-		qr.coltype[i] = newTypeConverter(col.Type)
+		qr.coltype[i], err = newTypeConverter(col.Type, col.TypeSignature)
+		if err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+func (qr *driverRows) scheduleProgressUpdate(id string, stats stmtStats) {
+	if qr.stmt.conn.progressUpdater == nil {
+		return
+	}
+
+	qrStats := QueryProgressInfo{
+		QueryId:    id,
+		QueryStats: stats,
+	}
+	currentTime := time.Now()
+	diff := currentTime.Sub(qr.stmt.conn.progressUpdaterPeriod.LastCallbackTime)
+	period := qr.stmt.conn.progressUpdaterPeriod.Period
+
+	// Check if period has not passed yet AND if query state did not change
+	if diff < period && qr.stmt.conn.progressUpdaterPeriod.LastQueryState == qrStats.QueryStats.State {
+		return
+	}
+
+	select {
+	case qr.statsCh <- qrStats:
+	default:
+		// ignore when can't send stats
+	}
+	qr.stmt.conn.progressUpdaterPeriod.LastCallbackTime = currentTime
+	qr.stmt.conn.progressUpdaterPeriod.LastQueryState = qrStats.QueryStats.State
 }
 
 type typeConverter struct {
 	typeName   string
-	parsedType []string // e.g. array, array, varchar, for [][]string
+	parsedType []string
+	scanType   reflect.Type
+	precision  optionalInt64
+	scale      optionalInt64
+	size       optionalInt64
 }
 
-func newTypeConverter(typeName string) *typeConverter {
-	return &typeConverter{
+type optionalInt64 struct {
+	value    int64
+	hasValue bool
+}
+
+func newOptionalInt64(value int64) optionalInt64 {
+	return optionalInt64{value: value, hasValue: true}
+}
+
+func newTypeConverter(typeName string, signature typeSignature) (*typeConverter, error) {
+	result := &typeConverter{
 		typeName:   typeName,
-		parsedType: parseType(typeName),
+		parsedType: getNestedTypes([]string{}, signature),
 	}
-}
-
-// parses Trino types, e.g. array(varchar(10)) to "array", "varchar"
-// TODO: Use queryColumn.TypeSignature instead.
-func parseType(name string) []string {
-	parts := strings.Split(strings.ToLower(name), "(")
-	if len(parts) == 1 {
-		return parts
+	var err error
+	result.scanType, err = getScanType(result.parsedType)
+	if err != nil {
+		return nil, err
 	}
-	last := len(parts) - 1
-	parts[last] = strings.TrimRight(parts[last], ")")
-	if len(parts[last]) > 0 {
-		if _, err := strconv.Atoi(parts[last]); err == nil {
-			parts = parts[:last]
+	switch signature.RawType {
+	case "char", "varchar":
+		if len(signature.Arguments) > 0 {
+			if signature.Arguments[0].Kind != KIND_LONG {
+				return nil, ErrInvalidResponseType
+			}
+			result.size = newOptionalInt64(signature.Arguments[0].long)
+		}
+	case "decimal":
+		if len(signature.Arguments) > 0 {
+			if signature.Arguments[0].Kind != KIND_LONG {
+				return nil, ErrInvalidResponseType
+			}
+			result.precision = newOptionalInt64(signature.Arguments[0].long)
+		}
+		if len(signature.Arguments) > 1 {
+			if signature.Arguments[1].Kind != KIND_LONG {
+				return nil, ErrInvalidResponseType
+			}
+			result.scale = newOptionalInt64(signature.Arguments[1].long)
+		}
+	case "time", "time with time zone", "timestamp", "timestamp with time zone":
+		if len(signature.Arguments) > 0 {
+			if signature.Arguments[0].Kind != KIND_LONG {
+				return nil, ErrInvalidResponseType
+			}
+			result.precision = newOptionalInt64(signature.Arguments[0].long)
 		}
 	}
-	return parts
+
+	return result, nil
+}
+
+func getNestedTypes(types []string, signature typeSignature) []string {
+	types = append(types, signature.RawType)
+	if len(signature.Arguments) == 1 {
+		switch signature.Arguments[0].Kind {
+		case KIND_TYPE:
+			types = getNestedTypes(types, signature.Arguments[0].typeSignature)
+		case KIND_NAMED_TYPE:
+			types = getNestedTypes(types, signature.Arguments[0].namedTypeSignature.TypeSignature)
+		}
+	}
+	return types
+}
+
+func getScanType(typeNames []string) (reflect.Type, error) {
+	var v interface{}
+	switch typeNames[0] {
+	case "boolean":
+		v = sql.NullBool{}
+	case "json", "char", "varchar", "varbinary", "interval year to month", "interval day to second", "decimal", "ipaddress", "uuid", "unknown":
+		v = sql.NullString{}
+	case "tinyint", "smallint":
+		v = sql.NullInt32{}
+	case "integer":
+		v = sql.NullInt32{}
+	case "bigint":
+		v = sql.NullInt64{}
+	case "real", "double":
+		v = sql.NullFloat64{}
+	case "date", "time", "time with time zone", "timestamp", "timestamp with time zone":
+		v = sql.NullTime{}
+	case "map":
+		v = NullMap{}
+	case "array":
+		if len(typeNames) <= 1 {
+			return nil, ErrInvalidResponseType
+		}
+		switch typeNames[1] {
+		case "boolean":
+			v = NullSliceBool{}
+		case "json", "char", "varchar", "varbinary", "interval year to month", "interval day to second", "decimal", "ipaddress", "uuid", "unknown":
+			v = NullSliceString{}
+		case "tinyint", "smallint", "integer", "bigint":
+			v = NullSliceInt64{}
+		case "real", "double":
+			v = NullSliceFloat64{}
+		case "date", "time", "time with time zone", "timestamp", "timestamp with time zone":
+			v = NullSliceTime{}
+		case "map":
+			v = NullSliceMap{}
+		case "array":
+			if len(typeNames) <= 2 {
+				return nil, ErrInvalidResponseType
+			}
+			switch typeNames[2] {
+			case "boolean":
+				v = NullSlice2Bool{}
+			case "json", "char", "varchar", "varbinary", "interval year to month", "interval day to second", "decimal", "ipaddress", "uuid", "unknown":
+				v = NullSlice2String{}
+			case "tinyint", "smallint", "integer", "bigint":
+				v = NullSlice2Int64{}
+			case "real", "double":
+				v = NullSlice2Float64{}
+			case "date", "time", "time with time zone", "timestamp", "timestamp with time zone":
+				v = NullSlice2Time{}
+			case "map":
+				v = NullSlice2Map{}
+			case "array":
+				if len(typeNames) <= 3 {
+					return nil, ErrInvalidResponseType
+				}
+				switch typeNames[3] {
+				case "boolean":
+					v = NullSlice3Bool{}
+				case "json", "char", "varchar", "varbinary", "interval year to month", "interval day to second", "decimal", "ipaddress", "uuid", "unknown":
+					v = NullSlice3String{}
+				case "tinyint", "smallint", "integer", "bigint":
+					v = NullSlice3Int64{}
+				case "real", "double":
+					v = NullSlice3Float64{}
+				case "date", "time", "time with time zone", "timestamp", "timestamp with time zone":
+					v = NullSlice3Time{}
+				case "map":
+					v = NullSlice3Map{}
+				}
+				// if this is a 4 or more dimensional array, scan type will be an empty interface
+			}
+		}
+	}
+	if v == nil {
+		return reflect.TypeOf(new(interface{})).Elem(), nil
+	}
+	return reflect.TypeOf(v), nil
 }
 
 // ConvertValue implements the driver.ValueConverter interface.
@@ -957,7 +1596,7 @@ func (c *typeConverter) ConvertValue(v interface{}) (driver.Value, error) {
 			return nil, err
 		}
 		return vv.Bool, err
-	case "json", "char", "varchar", "varbinary", "interval year to month", "interval day to second", "decimal", "ipaddress", "unknown":
+	case "json", "char", "varchar", "varbinary", "interval year to month", "interval day to second", "decimal", "ipaddress", "uuid", "Geometry", "SphericalGeography", "unknown":
 		vv, err := scanNullString(v)
 		if !vv.Valid {
 			return nil, err
@@ -987,6 +1626,11 @@ func (c *typeConverter) ConvertValue(v interface{}) (driver.Value, error) {
 		}
 		return v, nil
 	case "array":
+		if err := validateSlice(v); err != nil {
+			return nil, err
+		}
+		return v, nil
+	case "row":
 		if err := validateSlice(v); err != nil {
 			return nil, err
 		}
@@ -1037,6 +1681,7 @@ type NullSliceBool struct {
 // Scan implements the sql.Scanner interface.
 func (s *NullSliceBool) Scan(value interface{}) error {
 	if value == nil {
+		s.SliceBool, s.Valid = []sql.NullBool{}, false
 		return nil
 	}
 	vs, ok := value.([]interface{})
@@ -1065,6 +1710,7 @@ type NullSlice2Bool struct {
 // Scan implements the sql.Scanner interface.
 func (s *NullSlice2Bool) Scan(value interface{}) error {
 	if value == nil {
+		s.Slice2Bool, s.Valid = [][]sql.NullBool{}, false
 		return nil
 	}
 	vs, ok := value.([]interface{})
@@ -1093,6 +1739,7 @@ type NullSlice3Bool struct {
 // Scan implements the sql.Scanner interface.
 func (s *NullSlice3Bool) Scan(value interface{}) error {
 	if value == nil {
+		s.Slice3Bool, s.Valid = [][][]sql.NullBool{}, false
 		return nil
 	}
 	vs, ok := value.([]interface{})
@@ -1133,6 +1780,7 @@ type NullSliceString struct {
 // Scan implements the sql.Scanner interface.
 func (s *NullSliceString) Scan(value interface{}) error {
 	if value == nil {
+		s.SliceString, s.Valid = []sql.NullString{}, false
 		return nil
 	}
 	vs, ok := value.([]interface{})
@@ -1161,6 +1809,7 @@ type NullSlice2String struct {
 // Scan implements the sql.Scanner interface.
 func (s *NullSlice2String) Scan(value interface{}) error {
 	if value == nil {
+		s.Slice2String, s.Valid = [][]sql.NullString{}, false
 		return nil
 	}
 	vs, ok := value.([]interface{})
@@ -1189,6 +1838,7 @@ type NullSlice3String struct {
 // Scan implements the sql.Scanner interface.
 func (s *NullSlice3String) Scan(value interface{}) error {
 	if value == nil {
+		s.Slice3String, s.Valid = [][][]sql.NullString{}, false
 		return nil
 	}
 	vs, ok := value.([]interface{})
@@ -1234,6 +1884,7 @@ type NullSliceInt64 struct {
 // Scan implements the sql.Scanner interface.
 func (s *NullSliceInt64) Scan(value interface{}) error {
 	if value == nil {
+		s.SliceInt64, s.Valid = []sql.NullInt64{}, false
 		return nil
 	}
 	vs, ok := value.([]interface{})
@@ -1262,6 +1913,7 @@ type NullSlice2Int64 struct {
 // Scan implements the sql.Scanner interface.
 func (s *NullSlice2Int64) Scan(value interface{}) error {
 	if value == nil {
+		s.Slice2Int64, s.Valid = [][]sql.NullInt64{}, false
 		return nil
 	}
 	vs, ok := value.([]interface{})
@@ -1290,6 +1942,7 @@ type NullSlice3Int64 struct {
 // Scan implements the sql.Scanner interface.
 func (s *NullSlice3Int64) Scan(value interface{}) error {
 	if value == nil {
+		s.Slice3Int64, s.Valid = [][][]sql.NullInt64{}, false
 		return nil
 	}
 	vs, ok := value.([]interface{})
@@ -1317,7 +1970,7 @@ func scanNullFloat64(v interface{}) (sql.NullFloat64, error) {
 	if ok {
 		vFloat, err := vNumber.Float64()
 		if err != nil {
-			return sql.NullFloat64{}, fmt.Errorf("cannot convert %v (%T) to float64", vNumber, vNumber)
+			return sql.NullFloat64{}, fmt.Errorf("cannot convert %v (%T) to float64: %w", vNumber, vNumber, err)
 		}
 		return sql.NullFloat64{Valid: true, Float64: vFloat}, nil
 	}
@@ -1329,7 +1982,15 @@ func scanNullFloat64(v interface{}) (sql.NullFloat64, error) {
 	case "-Infinity":
 		return sql.NullFloat64{Valid: true, Float64: math.Inf(-1)}, nil
 	default:
-		return sql.NullFloat64{}, fmt.Errorf("cannot convert %v (%T) to float64", v, v)
+		vString, ok := v.(string)
+		if !ok {
+			return sql.NullFloat64{}, fmt.Errorf("cannot convert %v (%T) to float64", v, v)
+		}
+		vFloat, err := strconv.ParseFloat(vString, 64)
+		if err != nil {
+			return sql.NullFloat64{}, fmt.Errorf("cannot convert %v (%T) to float64: %w", v, v, err)
+		}
+		return sql.NullFloat64{Valid: true, Float64: vFloat}, nil
 	}
 }
 
@@ -1342,6 +2003,7 @@ type NullSliceFloat64 struct {
 // Scan implements the sql.Scanner interface.
 func (s *NullSliceFloat64) Scan(value interface{}) error {
 	if value == nil {
+		s.SliceFloat64, s.Valid = []sql.NullFloat64{}, false
 		return nil
 	}
 	vs, ok := value.([]interface{})
@@ -1370,6 +2032,7 @@ type NullSlice2Float64 struct {
 // Scan implements the sql.Scanner interface.
 func (s *NullSlice2Float64) Scan(value interface{}) error {
 	if value == nil {
+		s.Slice2Float64, s.Valid = [][]sql.NullFloat64{}, false
 		return nil
 	}
 	vs, ok := value.([]interface{})
@@ -1398,6 +2061,7 @@ type NullSlice3Float64 struct {
 // Scan implements the sql.Scanner interface.
 func (s *NullSlice3Float64) Scan(value interface{}) error {
 	if value == nil {
+		s.Slice3Float64, s.Valid = [][][]sql.NullFloat64{}, false
 		return nil
 	}
 	vs, ok := value.([]interface{})
@@ -1417,10 +2081,21 @@ func (s *NullSlice3Float64) Scan(value interface{}) error {
 	return nil
 }
 
+// Layout for time and timestamp WITHOUT time zone.
+// Trino can support up to 12 digits sub second precision, but Go only 9.
+// (Requires X-Trino-Client-Capabilities: PARAMETRIC_DATETIME)
 var timeLayouts = []string{
 	"2006-01-02",
-	"15:04:05.000",
-	"2006-01-02 15:04:05.000",
+	"15:04:05.999999999",
+	"2006-01-02 15:04:05.999999999",
+}
+
+// Layout for time and timestamp WITH time zone.
+// Trino can support up to 12 digits sub second precision, but Go only 9.
+// (Requires X-Trino-Client-Capabilities: PARAMETRIC_DATETIME)
+var timeLayoutsTZ = []string{
+	"15:04:05.999999999 -07:00",
+	"2006-01-02 15:04:05.999999999 -07:00",
 }
 
 func scanNullTime(v interface{}) (NullTime, error) {
@@ -1434,6 +2109,19 @@ func scanNullTime(v interface{}) (NullTime, error) {
 	vparts := strings.Split(vv, " ")
 	if len(vparts) > 1 && !unicode.IsDigit(rune(vparts[len(vparts)-1][0])) {
 		return parseNullTimeWithLocation(vv)
+	}
+	// Time literals may not have spaces before the timezone.
+	if strings.ContainsRune(vv, '+') {
+		return parseNullTimeWithLocation(strings.Replace(vv, "+", " +", 1))
+	}
+	hyphenCount := strings.Count(vv, "-")
+	// We need to ensure we don't treat the hyphens in dates as the minus offset sign.
+	// So if there's only one hyphen or more than 2, we have a negative offset.
+	if hyphenCount == 1 || hyphenCount > 2 {
+		// We add a space before the last hyphen to parse properly.
+		i := strings.LastIndex(vv, "-")
+		timestamp := vv[:i] + strings.Replace(vv[i:], "-", " -", 1)
+		return parseNullTimeWithLocation(timestamp)
 	}
 	return parseNullTime(vv)
 }
@@ -1456,11 +2144,24 @@ func parseNullTimeWithLocation(v string) (NullTime, error) {
 		return NullTime{}, fmt.Errorf("cannot convert %v (%T) to time+zone", v, v)
 	}
 	stamp, location := v[:idx], v[idx+1:]
+	var t time.Time
+	var err error
+	// Try offset timezones.
+	if strings.HasPrefix(location, "+") || strings.HasPrefix(location, "-") {
+		for _, layout := range timeLayoutsTZ {
+			t, err = time.Parse(layout, v)
+			if err == nil {
+				return NullTime{Valid: true, Time: t}, nil
+			}
+		}
+		return NullTime{}, err
+	}
 	loc, err := time.LoadLocation(location)
+	// Not a named location.
 	if err != nil {
 		return NullTime{}, fmt.Errorf("cannot load timezone %q: %v", location, err)
 	}
-	var t time.Time
+
 	for _, layout := range timeLayouts {
 		t, err = time.ParseInLocation(layout, stamp, loc)
 		if err == nil {
@@ -1480,6 +2181,10 @@ type NullTime struct {
 
 // Scan implements the sql.Scanner interface.
 func (s *NullTime) Scan(value interface{}) error {
+	if value == nil {
+		s.Time, s.Valid = time.Time{}, false
+		return nil
+	}
 	switch t := value.(type) {
 	case time.Time:
 		s.Time, s.Valid = t, true
@@ -1498,6 +2203,7 @@ type NullSliceTime struct {
 // Scan implements the sql.Scanner interface.
 func (s *NullSliceTime) Scan(value interface{}) error {
 	if value == nil {
+		s.SliceTime, s.Valid = []NullTime{}, false
 		return nil
 	}
 	vs, ok := value.([]interface{})
@@ -1526,6 +2232,7 @@ type NullSlice2Time struct {
 // Scan implements the sql.Scanner interface.
 func (s *NullSlice2Time) Scan(value interface{}) error {
 	if value == nil {
+		s.Slice2Time, s.Valid = [][]NullTime{}, false
 		return nil
 	}
 	vs, ok := value.([]interface{})
@@ -1554,6 +2261,7 @@ type NullSlice3Time struct {
 // Scan implements the sql.Scanner interface.
 func (s *NullSlice3Time) Scan(value interface{}) error {
 	if value == nil {
+		s.Slice3Time, s.Valid = [][][]NullTime{}, false
 		return nil
 	}
 	vs, ok := value.([]interface{})
@@ -1582,6 +2290,7 @@ type NullMap struct {
 // Scan implements the sql.Scanner interface.
 func (m *NullMap) Scan(v interface{}) error {
 	if v == nil {
+		m.Map, m.Valid = map[string]interface{}{}, false
 		return nil
 	}
 	m.Map, m.Valid = v.(map[string]interface{})
@@ -1597,6 +2306,7 @@ type NullSliceMap struct {
 // Scan implements the sql.Scanner interface.
 func (s *NullSliceMap) Scan(value interface{}) error {
 	if value == nil {
+		s.SliceMap, s.Valid = []NullMap{}, false
 		return nil
 	}
 	vs, ok := value.([]interface{})
@@ -1627,6 +2337,7 @@ type NullSlice2Map struct {
 // Scan implements the sql.Scanner interface.
 func (s *NullSlice2Map) Scan(value interface{}) error {
 	if value == nil {
+		s.Slice2Map, s.Valid = [][]NullMap{}, false
 		return nil
 	}
 	vs, ok := value.([]interface{})
@@ -1655,6 +2366,7 @@ type NullSlice3Map struct {
 // Scan implements the sql.Scanner interface.
 func (s *NullSlice3Map) Scan(value interface{}) error {
 	if value == nil {
+		s.Slice3Map, s.Valid = [][][]NullMap{}, false
 		return nil
 	}
 	vs, ok := value.([]interface{})
@@ -1672,4 +2384,20 @@ func (s *NullSlice3Map) Scan(value interface{}) error {
 	s.Slice3Map = slice
 	s.Valid = true
 	return nil
+}
+
+type QueryProgressInfo struct {
+	QueryId    string
+	QueryStats stmtStats
+}
+
+type queryProgressCallbackPeriod struct {
+	Period           time.Duration
+	LastCallbackTime time.Time
+	LastQueryState   string
+}
+
+type ProgressUpdater interface {
+	// Update the query progress, immediately when the query starts, when receiving data, and once when the query is finished.
+	Update(QueryProgressInfo)
 }

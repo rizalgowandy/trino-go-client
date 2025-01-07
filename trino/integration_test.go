@@ -15,50 +15,264 @@
 package trino
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"database/sql"
+	"database/sql/driver"
+	"encoding/pem"
 	"errors"
 	"flag"
+	"fmt"
+	"io"
+	"log"
+	"math"
+	"math/big"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ahmetb/dlog"
+	"github.com/golang-jwt/jwt/v5"
+	dt "github.com/ory/dockertest/v3"
+	docker "github.com/ory/dockertest/v3/docker"
 )
 
 var (
+	pool     *dt.Pool
+	resource *dt.Resource
+
+	trinoImageTagFlag = flag.String(
+		"trino_image_tag",
+		os.Getenv("TRINO_IMAGE_TAG"),
+		"Docker image tag used for the Trino server container",
+	)
 	integrationServerFlag = flag.String(
 		"trino_server_dsn",
 		os.Getenv("TRINO_SERVER_DSN"),
-		"dsn of the Trino server used for integration tests; default disabled",
+		"dsn of the Trino server used for integration tests instead of starting a Docker container",
 	)
 	integrationServerQueryTimeout = flag.Duration(
 		"trino_query_timeout",
 		5*time.Second,
 		"max duration for Trino queries to run before giving up",
 	)
+	noCleanup = flag.Bool(
+		"no_cleanup",
+		false,
+		"do not delete containers on exit",
+	)
+	tlsServer = ""
 )
 
-func init() {
-	// explicitly init testing module so flags are registered before call to flag.Parse
-	testing.Init()
+func TestMain(m *testing.M) {
 	flag.Parse()
 	DefaultQueryTimeout = *integrationServerQueryTimeout
 	DefaultCancelQueryTimeout = *integrationServerQueryTimeout
+	if *trinoImageTagFlag == "" {
+		*trinoImageTagFlag = "latest"
+	}
+
+	var err error
+	if *integrationServerFlag == "" && !testing.Short() {
+		pool, err = dt.NewPool("")
+		if err != nil {
+			log.Fatalf("Could not connect to docker: %s", err)
+		}
+		pool.MaxWait = 1 * time.Minute
+
+		wd, err := os.Getwd()
+		if err != nil {
+			log.Fatalf("Failed to get working directory: %s", err)
+		}
+		name := "trino-go-client-tests"
+		var ok bool
+		resource, ok = pool.ContainerByName(name)
+
+		if !ok {
+			err = generateCerts(wd + "/etc/secrets")
+			if err != nil {
+				log.Fatalf("Could not generate TLS certificates: %s", err)
+			}
+			resource, err = pool.RunWithOptions(&dt.RunOptions{
+				Name:       name,
+				Repository: "trinodb/trino",
+				Tag:        *trinoImageTagFlag,
+				Mounts:     []string{wd + "/etc:/etc/trino"},
+				ExposedPorts: []string{
+					"8080/tcp",
+					"8443/tcp",
+				},
+			})
+			if err != nil {
+				log.Fatalf("Could not start resource: %s", err)
+			}
+		} else if !resource.Container.State.Running {
+			pool.Client.StartContainer(resource.Container.ID, nil)
+		}
+
+		if err := pool.Retry(func() error {
+			c, err := pool.Client.InspectContainer(resource.Container.ID)
+			if err != nil {
+				log.Fatalf("Failed to inspect container %s: %s", resource.Container.ID, err)
+			}
+			if !c.State.Running {
+				log.Fatalf("Container %s is not running: %s\nContainer logs:\n%s", resource.Container.ID, c.State.String(), getLogs(resource.Container.ID))
+			}
+			log.Printf("Waiting for Trino container: %s\n", c.State.String())
+			if c.State.Health.Status != "healthy" {
+				return errors.New("Not ready")
+			}
+			return nil
+		}); err != nil {
+			log.Fatalf("Timed out waiting for container to get ready: %s\nContainer logs:\n%s", err, getLogs(resource.Container.ID))
+		}
+		*integrationServerFlag = "http://test@localhost:" + resource.GetPort("8080/tcp")
+		tlsServer = "https://admin:admin@localhost:" + resource.GetPort("8443/tcp")
+
+		http.DefaultTransport.(*http.Transport).TLSClientConfig, err = getTLSConfig(wd + "/etc/secrets")
+		if err != nil {
+			log.Fatalf("Failed to set the default TLS config: %s", err)
+		}
+	}
+
+	code := m.Run()
+
+	if !*noCleanup && pool != nil && resource != nil {
+		// You can't defer this because os.Exit doesn't care for defer
+		if err := pool.Purge(resource); err != nil {
+			log.Fatalf("Could not purge resource: %s", err)
+		}
+	}
+
+	os.Exit(code)
 }
 
-// integrationServerDSN returns the URL of the integration test server.
-func integrationServerDSN(t *testing.T) string {
-	if dsn := *integrationServerFlag; dsn != "" {
-		return dsn
+func generateCerts(dir string) error {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return fmt.Errorf("failed to generate private key: %w", err)
 	}
-	t.Skip()
-	return ""
+
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return fmt.Errorf("failed to generate serial number: %w", err)
+	}
+
+	template := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			Organization: []string{"Trino Software Foundation"},
+		},
+		DNSNames:              []string{"localhost"},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(1 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+
+	privBytes, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return fmt.Errorf("unable to marshal private key: %w", err)
+	}
+	privBlock := &pem.Block{Type: "PRIVATE KEY", Bytes: privBytes}
+	err = writePEM(dir+"/private_key.pem", privBlock)
+	if err != nil {
+		return err
+	}
+
+	pubBytes, err := x509.MarshalPKIXPublicKey(&priv.PublicKey)
+	if err != nil {
+		return fmt.Errorf("unable to marshal public key: %w", err)
+	}
+	pubBlock := &pem.Block{Type: "PUBLIC KEY", Bytes: pubBytes}
+	err = writePEM(dir+"/public_key.pem", pubBlock)
+	if err != nil {
+		return err
+	}
+
+	certBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		return fmt.Errorf("failed to create certificate: %w", err)
+	}
+	certBlock := &pem.Block{Type: "CERTIFICATE", Bytes: certBytes}
+	err = writePEM(dir+"/certificate.pem", certBlock)
+	if err != nil {
+		return err
+	}
+
+	err = writePEM(dir+"/certificate_with_key.pem", certBlock, privBlock, pubBlock)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func writePEM(filename string, blocks ...*pem.Block) error {
+	// all files are world-readable, so they can be read inside the Trino container
+	out, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("failed to open %s for writing: %w", filename, err)
+	}
+	for _, block := range blocks {
+		if err := pem.Encode(out, block); err != nil {
+			return fmt.Errorf("failed to write %s data to %s: %w", block.Type, filename, err)
+		}
+	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("error closing %s: %w", filename, err)
+	}
+	return nil
+}
+
+func getTLSConfig(dir string) (*tls.Config, error) {
+	certPool, err := x509.SystemCertPool()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read the system cert pool: %s", err)
+	}
+	caCertPEM, err := os.ReadFile(dir + "/certificate.pem")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read the certificate: %s", err)
+	}
+	ok := certPool.AppendCertsFromPEM(caCertPEM)
+	if !ok {
+		return nil, fmt.Errorf("failed to parse the certificate: %s", err)
+	}
+	return &tls.Config{
+		RootCAs: certPool,
+	}, nil
+}
+
+func getLogs(id string) []byte {
+	var buf bytes.Buffer
+	pool.Client.Logs(docker.LogsOptions{
+		Container:    id,
+		OutputStream: &buf,
+		ErrorStream:  &buf,
+		Stdout:       true,
+		Stderr:       true,
+		RawTerminal:  true,
+	})
+	logs, _ := io.ReadAll(dlog.NewReader(&buf))
+	return logs
 }
 
 // integrationOpen opens a connection to the integration test server.
 func integrationOpen(t *testing.T, dsn ...string) *sql.DB {
-	target := integrationServerDSN(t)
+	if testing.Short() {
+		t.Skip("Skipping test in short mode.")
+	}
+	target := *integrationServerFlag
 	if len(dsn) > 0 {
 		target = dsn[0]
 	}
@@ -71,14 +285,6 @@ func integrationOpen(t *testing.T, dsn ...string) *sql.DB {
 
 // integration tests based on python tests:
 // https://github.com/trinodb/trino-python-client/tree/master/integration_tests
-
-func TestIntegrationEnabled(t *testing.T) {
-	dsn := *integrationServerFlag
-	if dsn == "" {
-		example := "http://test@localhost:8080"
-		t.Skip("integration tests not enabled; use e.g. -trino_server_dsn=" + example)
-	}
-}
 
 type nodesRow struct {
 	NodeID      string
@@ -111,14 +317,14 @@ func TestIntegrationSelectQueryIterator(t *testing.T) {
 			t.Fatal(err)
 		}
 		if col.NodeID != "test" {
-			t.Fatal("node_id != test")
+			t.Errorf("Expected node_id == test but got %s", col.NodeID)
 		}
 	}
 	if err = rows.Err(); err != nil {
 		t.Fatal(err)
 	}
 	if count < 1 {
-		t.Fatal("no rows returned")
+		t.Error("no rows returned")
 	}
 }
 
@@ -147,9 +353,55 @@ func TestIntegrationSelectFailedQuery(t *testing.T) {
 		rows.Close()
 		t.Fatal("query to invalid catalog succeeded")
 	}
-	_, ok := err.(*ErrQueryFailed)
+	queryFailed, ok := err.(*ErrQueryFailed)
 	if !ok {
 		t.Fatal("unexpected error:", err)
+	}
+	trinoErr, ok := errors.Unwrap(queryFailed).(*ErrTrino)
+	if !ok {
+		t.Fatal("unexpected error:", trinoErr)
+	}
+	expected := ErrTrino{
+		Message:   "line 1:15: Catalog 'catalog'",
+		SqlState:  "",
+		ErrorCode: 44,
+		ErrorName: "CATALOG_NOT_FOUND",
+		ErrorType: "USER_ERROR",
+		ErrorLocation: ErrorLocation{
+			LineNumber:   1,
+			ColumnNumber: 15,
+		},
+		FailureInfo: FailureInfo{
+			Type:    "io.trino.spi.TrinoException",
+			Message: "line 1:15: Catalog 'catalog'",
+		},
+	}
+	if !strings.HasPrefix(trinoErr.Message, expected.Message) {
+		t.Fatalf("expected ErrTrino.Message to start with `%s`, got: %s", expected.Message, trinoErr.Message)
+	}
+	if trinoErr.SqlState != expected.SqlState {
+		t.Fatalf("expected ErrTrino.SqlState to be `%s`, got: %s", expected.SqlState, trinoErr.SqlState)
+	}
+	if trinoErr.ErrorCode != expected.ErrorCode {
+		t.Fatalf("expected ErrTrino.ErrorCode to be `%d`, got: %d", expected.ErrorCode, trinoErr.ErrorCode)
+	}
+	if trinoErr.ErrorName != expected.ErrorName {
+		t.Fatalf("expected ErrTrino.ErrorName to be `%s`, got: %s", expected.ErrorName, trinoErr.ErrorName)
+	}
+	if trinoErr.ErrorType != expected.ErrorType {
+		t.Fatalf("expected ErrTrino.ErrorType to be `%s`, got: %s", expected.ErrorType, trinoErr.ErrorType)
+	}
+	if trinoErr.ErrorLocation.LineNumber != expected.ErrorLocation.LineNumber {
+		t.Fatalf("expected ErrTrino.ErrorLocation.LineNumber to be `%d`, got: %d", expected.ErrorLocation.LineNumber, trinoErr.ErrorLocation.LineNumber)
+	}
+	if trinoErr.ErrorLocation.ColumnNumber != expected.ErrorLocation.ColumnNumber {
+		t.Fatalf("expected ErrTrino.ErrorLocation.ColumnNumber to be `%d`, got: %d", expected.ErrorLocation.ColumnNumber, trinoErr.ErrorLocation.ColumnNumber)
+	}
+	if trinoErr.FailureInfo.Type != expected.FailureInfo.Type {
+		t.Fatalf("expected ErrTrino.FailureInfo.Type to be `%s`, got: %s", expected.FailureInfo.Type, trinoErr.FailureInfo.Type)
+	}
+	if !strings.HasPrefix(trinoErr.FailureInfo.Message, expected.FailureInfo.Message) {
+		t.Fatalf("expected ErrTrino.FailureInfo.Message to start with `%s`, got: %s", expected.FailureInfo.Message, trinoErr.FailureInfo.Message)
 	}
 }
 
@@ -244,8 +496,8 @@ handleErr:
 }
 
 func TestIntegrationSessionProperties(t *testing.T) {
-	dsn := integrationServerDSN(t)
-	dsn += "?session_properties=query_max_run_time=10m,query_priority=2"
+	dsn := *integrationServerFlag
+	dsn += "?session_properties=query_max_run_time%3A10m%3Bquery_priority%3A2"
 	db := integrationOpen(t, dsn)
 	defer db.Close()
 	rows, err := db.Query("SHOW SESSION")
@@ -283,8 +535,12 @@ func TestIntegrationSessionProperties(t *testing.T) {
 }
 
 func TestIntegrationTypeConversion(t *testing.T) {
-	dsn := integrationServerDSN(t)
-	dsn += "?session_properties=parse_decimal_literals_as_double=true"
+	err := RegisterCustomClient("uncompressed", &http.Client{Transport: &http.Transport{DisableCompression: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dsn := *integrationServerFlag
+	dsn += "?custom_client=uncompressed"
 	db := integrationOpen(t, dsn)
 	var (
 		goTime            time.Time
@@ -302,8 +558,9 @@ func TestIntegrationTypeConversion(t *testing.T) {
 		nullFloat64Slice3 NullSlice3Float64
 		goMap             map[string]interface{}
 		nullMap           NullMap
+		goRow             []interface{}
 	)
-	err := db.QueryRow(`
+	err = db.QueryRow(`
 		SELECT
 			TIMESTAMP '2017-07-10 01:02:03.004 UTC',
 			CAST(NULL AS TIMESTAMP),
@@ -319,7 +576,8 @@ func TestIntegrationTypeConversion(t *testing.T) {
 			ARRAY[ARRAY[1.1, 1.1, 1.1], NULL],
 			ARRAY[ARRAY[ARRAY[1.1, 1.1, 1.1], NULL], NULL],
 			MAP(ARRAY['a', 'b'], ARRAY['c', 'd']),
-			CAST(NULL AS MAP(ARRAY(INTEGER), ARRAY(INTEGER)))
+			CAST(NULL AS MAP(ARRAY(INTEGER), ARRAY(INTEGER))),
+			ROW(1, 'a', CAST('2017-07-10 01:02:03.004 UTC' AS TIMESTAMP(6) WITH TIME ZONE), ARRAY['c'])
 	`).Scan(
 		&goTime,
 		&nullTime,
@@ -336,7 +594,48 @@ func TestIntegrationTypeConversion(t *testing.T) {
 		&nullFloat64Slice3,
 		&goMap,
 		&nullMap,
+		&goRow,
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIntegrationArgsConversion(t *testing.T) {
+	dsn := *integrationServerFlag
+	db := integrationOpen(t, dsn)
+	value := 0
+	err := db.QueryRow(`
+		SELECT 1 FROM (VALUES (
+			CAST(1 AS TINYINT),
+			CAST(1 AS SMALLINT),
+			CAST(1 AS INTEGER),
+			CAST(1 AS BIGINT),
+			CAST(1 AS REAL),
+			CAST(1 AS DOUBLE),
+			TIMESTAMP '2017-07-10 01:02:03.004 UTC',
+			CAST('string' AS VARCHAR),
+			ARRAY['A', 'B']
+			)) AS t(col_tiny, col_small, col_int, col_big, col_real, col_double, col_ts, col_varchar, col_array )
+			WHERE 1=1
+			AND col_tiny = ?
+			AND col_small = ?
+			AND col_int = ?
+			AND col_big = ?
+			AND col_real = cast(? as real)
+			AND col_double = cast(? as double)
+			AND col_ts = ?
+			AND col_varchar = ?
+			AND col_array = ?`,
+		int16(1),
+		int16(1),
+		int32(1),
+		int64(1),
+		Numeric("1"),
+		Numeric("1"),
+		time.Date(2017, 7, 10, 1, 2, 3, 4*1000000, time.UTC),
+		"string",
+		[]string{"A", "B"}).Scan(&value)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,7 +660,7 @@ func TestIntegrationQueryParametersSelect(t *testing.T) {
 		name          string
 		query         string
 		args          []interface{}
-		expectedError bool
+		expectedError error
 		expectedRows  int
 	}{
 		{
@@ -380,13 +679,13 @@ func TestIntegrationQueryParametersSelect(t *testing.T) {
 			name:          "invalid string as bigint",
 			query:         "SELECT * FROM tpch.sf1.customer WHERE custkey=? LIMIT 2",
 			args:          []interface{}{"1"},
-			expectedError: true,
+			expectedError: errors.New(`trino: query failed (200 OK): "USER_ERROR: line 1:46: Cannot apply operator: bigint = varchar(1)"`),
 		},
 		{
 			name:          "valid string as date",
 			query:         "SELECT * FROM tpch.sf1.lineitem WHERE shipdate=? LIMIT 2",
 			args:          []interface{}{"1995-01-27"},
-			expectedError: true,
+			expectedError: errors.New(`trino: query failed (200 OK): "USER_ERROR: line 1:47: Cannot apply operator: date = varchar(10)"`),
 		},
 	}
 
@@ -399,16 +698,22 @@ func TestIntegrationQueryParametersSelect(t *testing.T) {
 
 			rows, err := db.Query(scenario.query, scenario.args...)
 			if err != nil {
-				if scenario.expectedError {
+				if scenario.expectedError == nil {
+					t.Errorf("Unexpected err: %s", err)
 					return
 				}
-				t.Fatal(err)
+				if err.Error() == scenario.expectedError.Error() {
+					return
+				}
+				t.Errorf("Expected err to be %s but got %s", scenario.expectedError, err)
 			}
-			defer rows.Close()
 
-			if scenario.expectedError {
-				t.Fatal("missing expected error")
+			if scenario.expectedError != nil {
+				t.Error("missing expected error")
+				return
 			}
+
+			defer rows.Close()
 
 			var count int
 			for rows.Next() {
@@ -418,9 +723,42 @@ func TestIntegrationQueryParametersSelect(t *testing.T) {
 				t.Fatal(err)
 			}
 			if count != scenario.expectedRows {
-				t.Fatalf("expecting %d rows, got %d", scenario.expectedRows, count)
+				t.Errorf("expecting %d rows, got %d", scenario.expectedRows, count)
 			}
 		})
+	}
+}
+
+func TestIntegrationQueryNextAfterClose(t *testing.T) {
+	// NOTE: This is testing invalid behaviour. It ensures that we don't
+	// panic if we call driverRows.Next after we closed the driverStmt.
+
+	ctx := context.Background()
+	conn, err := (&Driver{}).Open(*integrationServerFlag)
+	if err != nil {
+		t.Fatalf("Failed to open connection: %v", err)
+	}
+	defer conn.Close()
+
+	stmt, err := conn.(driver.ConnPrepareContext).PrepareContext(ctx, "SELECT 1")
+	if err != nil {
+		t.Fatalf("Failed preparing query: %v", err)
+	}
+
+	rows, err := stmt.(driver.StmtQueryContext).QueryContext(ctx, []driver.NamedValue{})
+	if err != nil {
+		t.Fatalf("Failed running query: %v", err)
+	}
+	defer rows.Close()
+
+	stmt.Close() // NOTE: the important bit.
+
+	var result driver.Value
+	if err := rows.Next([]driver.Value{result}); err != nil {
+		t.Fatalf("unexpected result: %+v, no error was expected", err)
+	}
+	if err := rows.Next([]driver.Value{result}); err != io.EOF {
+		t.Fatalf("unexpected result: %+v, expected io.EOF", err)
 	}
 }
 
@@ -459,7 +797,7 @@ func TestIntegrationExec(t *testing.T) {
 }
 
 func TestIntegrationUnsupportedHeader(t *testing.T) {
-	dsn := integrationServerDSN(t)
+	dsn := *integrationServerFlag
 	dsn += "?catalog=tpch&schema=sf10"
 	db := integrationOpen(t, dsn)
 	defer db.Close()
@@ -468,20 +806,12 @@ func TestIntegrationUnsupportedHeader(t *testing.T) {
 		err   error
 	}{
 		{
-			query: "SET SESSION grouped_execution=true",
-			err:   ErrUnsupportedHeader,
-		},
-		{
 			query: "SET ROLE dummy",
-			err:   errors.New(`trino: query failed (200 OK): "io.trino.spi.TrinoException: line 1:1: Role 'dummy' does not exist"`),
+			err:   errors.New(`trino: query failed (200 OK): "USER_ERROR: line 1:1: Role 'dummy' does not exist"`),
 		},
 		{
 			query: "SET PATH dummy",
-			err:   errors.New(`trino: query failed (200 OK): "io.trino.spi.TrinoException: SET PATH not supported by client"`),
-		},
-		{
-			query: "RESET SESSION grouped_execution",
-			err:   ErrUnsupportedHeader,
+			err:   errors.New(`trino: query failed (200 OK): "USER_ERROR: SET PATH not supported by client"`),
 		},
 	}
 	for _, c := range cases {
@@ -497,7 +827,7 @@ func TestIntegrationQueryContextCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dsn := integrationServerDSN(t)
+	dsn := *integrationServerFlag
 	dsn += "?catalog=tpch&schema=sf100&source=cancel-test&custom_client=uncompressed"
 	db := integrationOpen(t, dsn)
 	defer db.Close()
@@ -571,6 +901,82 @@ func TestIntegrationQueryContextCancellation(t *testing.T) {
 	}
 }
 
+func TestIntegrationAccessToken(t *testing.T) {
+	if tlsServer == "" {
+		t.Skip("Skipping access token test when using a custom integration server.")
+	}
+
+	accessToken, err := generateToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dsn := tlsServer + "?accessToken=" + accessToken
+
+	db := integrationOpen(t, dsn)
+
+	defer db.Close()
+	rows, err := db.Query("SHOW CATALOGS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		count++
+	}
+	if count < 1 {
+		t.Fatal("not enough rows returned:", count)
+	}
+}
+
+func generateToken() (string, error) {
+	privateKeyPEM, err := os.ReadFile("etc/secrets/private_key.pem")
+	if err != nil {
+		return "", fmt.Errorf("error reading private key file: %w", err)
+	}
+
+	privateKey, err := jwt.ParseRSAPrivateKeyFromPEM(privateKeyPEM)
+	if err != nil {
+		return "", fmt.Errorf("error parsing private key: %w", err)
+	}
+
+	// Subject must be 'test'
+	claims := jwt.RegisteredClaims{
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * 365 * time.Hour)),
+		Issuer:    "gotrino",
+		Subject:   "test",
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	signedToken, err := token.SignedString(privateKey)
+
+	if err != nil {
+		return "", fmt.Errorf("error generating token: %w", err)
+	}
+
+	return signedToken, nil
+}
+
+func TestIntegrationTLS(t *testing.T) {
+	if tlsServer == "" {
+		t.Skip("Skipping TLS test when using a custom integration server.")
+	}
+
+	dsn := tlsServer
+	db := integrationOpen(t, dsn)
+
+	defer db.Close()
+	row := db.QueryRow("SELECT 1")
+	var count int
+	if err := row.Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatal("unexpected count=", count)
+	}
+}
+
 func contextSleep(ctx context.Context, d time.Duration) error {
 	timer := time.NewTimer(100 * time.Millisecond)
 	select {
@@ -581,5 +987,155 @@ func contextSleep(ctx context.Context, d time.Duration) error {
 			<-timer.C
 		}
 		return ctx.Err()
+	}
+}
+
+func TestIntegrationDayToHourIntervalMilliPrecision(t *testing.T) {
+	db := integrationOpen(t)
+	defer db.Close()
+	tests := []struct {
+		name    string
+		arg     time.Duration
+		wantErr bool
+	}{
+		{
+			name:    "valid 1234567891s",
+			arg:     time.Duration(1234567891) * time.Second,
+			wantErr: false,
+		},
+		{
+			name:    "valid 123456789.1s",
+			arg:     time.Duration(123456789100) * time.Millisecond,
+			wantErr: false,
+		},
+		{
+			name:    "valid 12345678.91s",
+			arg:     time.Duration(12345678910) * time.Millisecond,
+			wantErr: false,
+		},
+		{
+			name:    "valid 1234567.891s",
+			arg:     time.Duration(1234567891) * time.Millisecond,
+			wantErr: false,
+		},
+		{
+			name:    "valid -1234567891s",
+			arg:     time.Duration(-1234567891) * time.Second,
+			wantErr: false,
+		},
+		{
+			name:    "valid -123456789.1s",
+			arg:     time.Duration(-123456789100) * time.Millisecond,
+			wantErr: false,
+		},
+		{
+			name:    "valid -12345678.91s",
+			arg:     time.Duration(-12345678910) * time.Millisecond,
+			wantErr: false,
+		},
+		{
+			name:    "valid -1234567.891s",
+			arg:     time.Duration(-1234567891) * time.Millisecond,
+			wantErr: false,
+		},
+		{
+			name:    "invalid 1234567891.2s",
+			arg:     time.Duration(1234567891200) * time.Millisecond,
+			wantErr: true,
+		},
+		{
+			name:    "invalid 123456789.12s",
+			arg:     time.Duration(123456789120) * time.Millisecond,
+			wantErr: true,
+		},
+		{
+			name:    "invalid 12345678.912s",
+			arg:     time.Duration(12345678912) * time.Millisecond,
+			wantErr: true,
+		},
+		{
+			name:    "invalid -1234567891.2s",
+			arg:     time.Duration(-1234567891200) * time.Millisecond,
+			wantErr: true,
+		},
+		{
+			name:    "invalid -123456789.12s",
+			arg:     time.Duration(-123456789120) * time.Millisecond,
+			wantErr: true,
+		},
+		{
+			name:    "invalid -12345678.912s",
+			arg:     time.Duration(-12345678912) * time.Millisecond,
+			wantErr: true,
+		},
+		{
+			name:    "invalid max seconds (9223372036)",
+			arg:     time.Duration(math.MaxInt64) / time.Second * time.Second,
+			wantErr: true,
+		},
+		{
+			name:    "invalid min seconds (-9223372036)",
+			arg:     time.Duration(math.MinInt64) / time.Second * time.Second,
+			wantErr: true,
+		},
+		{
+			name: "valid max seconds (2147483647)",
+			arg:  math.MaxInt32 * time.Second,
+		},
+		{
+			name: "valid min seconds (-2147483647)",
+			arg:  -math.MaxInt32 * time.Second,
+		},
+		{
+			name: "valid max minutes (153722867)",
+			arg:  time.Duration(math.MaxInt64) / time.Minute * time.Minute,
+		},
+		{
+			name: "valid min minutes (-153722867)",
+			arg:  time.Duration(math.MinInt64) / time.Minute * time.Minute,
+		},
+		{
+			name: "valid max hours (2562047)",
+			arg:  time.Duration(math.MaxInt64) / time.Hour * time.Hour,
+		},
+		{
+			name: "valid min hours (-2562047)",
+			arg:  time.Duration(math.MinInt64) / time.Hour * time.Hour,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := db.Exec("SELECT ?", test.arg)
+			if (err != nil) != test.wantErr {
+				t.Errorf("Exec() error = %v, wantErr %v", err, test.wantErr)
+				return
+			}
+		})
+	}
+}
+
+func TestIntegrationLargeQuery(t *testing.T) {
+	version, err := strconv.Atoi(*trinoImageTagFlag)
+	if (err != nil && *trinoImageTagFlag != "latest") || (err == nil && version < 418) {
+		t.Skip("Skipping test when not using Trino 418 or later.")
+	}
+	dsn := *integrationServerFlag
+	dsn += "?explicitPrepare=false"
+	db := integrationOpen(t, dsn)
+	defer db.Close()
+	rows, err := db.Query("SELECT ?, '"+strings.Repeat("a", 5000000)+"'", 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		count++
+	}
+	if rows.Err() != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatal("not enough rows returned:", count)
 	}
 }
